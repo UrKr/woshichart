@@ -1,6 +1,4 @@
-# System Architecture Documentation
-
-## 1. System Architecture Overview
+## 1. System Overview
 
 ```mermaid
 flowchart TB
