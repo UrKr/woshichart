@@ -13,26 +13,20 @@ All coordination happens via a single `/engine/sync.json` endpoint:
 
 ```mermaid
 flowchart TD
-    A[Sync Request] --> B{Update EC health}
-    B --> C[Process job_statuses]
-    C --> D[Determine jobs for this EC]
-    D --> E[Return jobs list]
+    A[Sync Request] --> B[Update EC health<br/>Process statuses<br/>Return jobs list]
     
-    F[New Job] --> G{Connected ECs<br/>available?}
-    G -->|Yes| H[Assign by priority<br/>then creation time<br/>to EC with most free resources]
-    G -->|No| I[Keep job pending]
+    C[New Job] --> D{ECs available?}
+    D -->|Yes| E[Assign by priority<br/>to least loaded EC]
+    D -->|No| F[Keep pending]
     
-    J[Timeout Process<br/>every 5-10s] --> K{Check timeouts}
-    K -->|Past deadline| L{Connected ECs<br/>available?}
-    L -->|Yes| M[Check DB for result<br/>Reassign job]
-    L -->|No| N[Keep job pending]
-    K -->|Disconnected EC| O{Connected ECs<br/>available?}
-    O -->|Yes| P[Check DB for result<br/>Reassign with preserved result]
-    O -->|No| Q[Keep job pending]
+    G[Timeout Process<br/>5-10s] --> H{Timeouts found?}
+    H -->|Yes| I{ECs available?}
+    I -->|Yes| J[Reassign with top priority<br/>preserve result]
+    I -->|No| F
     
-    R[Rebalancer<br/>every 30-60s] --> S{Connected ECs<br/>available?}
-    S -->|Yes| T[Check DB for results<br/>Assign by priority<br/>to least loaded ECs<br/>Set top priority on reassignments]
-    S -->|No| U[Jobs remain pending]
+    K[Rebalancer<br/>30-60s] --> L{ECs available?}
+    L -->|Yes| M[Assign pending by priority<br/>to least loaded ECs]
+    L -->|No| F
 ```
 
 ---
