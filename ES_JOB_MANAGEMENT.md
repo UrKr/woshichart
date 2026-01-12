@@ -15,18 +15,20 @@ All coordination happens via a single `/engine/sync.json` endpoint:
 flowchart TD
     A[Sync Request] --> B[Update EC health<br/>Process statuses<br/>Return jobs list]
     
-    C[New Job] --> D{ECs available?}
-    D -->|Yes| E[Assign by priority<br/>to least loaded EC]
-    D -->|No| F[Keep pending]
+    C[Assignment Process<br/>most frequent] --> D{Unassigned jobs?}
+    D -->|Yes| E{ECs available?}
+    E -->|Yes| F[Assign by priority<br/>to least loaded EC]
+    E -->|No| G[Keep pending]
     
-    G[Timeout Process<br/>5-10s] --> H{Timeouts found?}
-    H -->|Yes| I{ECs available?}
-    I -->|Yes| J[Reassign with top priority<br/>preserve result]
-    I -->|No| F
+    H[Timeout Process<br/>medium frequency] --> I{Jobs past deadline?}
+    I -->|Yes| J{ECs available?}
+    J -->|Yes| K[Reassign with top priority<br/>preserve result]
+    J -->|No| G
     
-    K[Rebalancer<br/>30-60s] --> L{ECs available?}
-    L -->|Yes| M[Assign pending by priority<br/>to least loaded ECs]
-    L -->|No| F
+    L[Rebalancer<br/>least frequent] --> M{Running jobs<br/>need rebalancing?}
+    M -->|Yes| N{ECs available?}
+    N -->|Yes| O[Reassign running jobs<br/>to balance load]
+    N -->|No| G
 ```
 
 ---
@@ -49,7 +51,7 @@ flowchart TD
 - `start_confirm_deadline`: deadline for EC to confirm start (`status: "completed"`)
 - `last_result` (nullable): last result from any EC (preserved on reassignment)
 - `created_at`: creation timestamp
-- `priority`: higher number = higher priority (rebalancer reassignments get top priority)
+- `priority`: higher number = higher priority (reassignments get top priority)
 
 **Assignment Order**: Priority (descending) → `created_at` (ascending)
 
@@ -82,22 +84,30 @@ Headers: `Authorization: Bearer {auth_token}`
 
 ## Periodic Processes
 
-### 1. Timeout Reassignment Process (every 5–10s)
+### 1. Assignment Process (most frequent)
 
-Handles jobs that failed to start or are on disconnected ECs:
+Handles jobs not yet assigned to an EngineClient:
+
+- Find `pending` jobs sorted by priority → `created_at`
+- Assign to least loaded connected EC (preserve `last_result` if exists)
+- Jobs remain `pending` if no connected ECs available
+
+### 2. Timeout Process (medium frequency)
+
+Checks if assigned jobs have been received by their EC:
 
 - `state = "assigned"` + `now > start_confirm_deadline`: Reassign with top priority (preserve `last_result` if exists)
 - `state = "running"` + disconnected EC: Reassign with top priority (preserve `last_result`)
 
-### 2. Rebalancer Process (every 30–60s)
+### 3. Rebalancer Process (least frequent)
 
-Optimizes job distribution:
+Optimizes distribution of running jobs:
 
 - Recompute load for all connected ECs (running job count per EC)
-- Assign `pending` jobs sorted by priority → `created_at` to least loaded ECs (preserve `last_result` if exists)
+- Reassign `running` jobs from overloaded to underloaded ECs (preserve `last_result`)
 - Reassignments get top priority
 
-Both processes use **atomic state updates** to avoid conflicts with normal request handling. Jobs remain `pending` if no connected ECs available.
+All processes use **atomic state updates** to avoid conflicts with normal request handling.
 
 ---
 
