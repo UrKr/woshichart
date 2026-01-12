@@ -18,13 +18,21 @@ flowchart TD
     C --> D[Determine jobs for this EC]
     D --> E[Return jobs list]
     
-    F[New Job] --> G[Assign to EC with<br/>most free resources]
+    F[New Job] --> G{Connected ECs<br/>available?}
+    G -->|Yes| H[Assign by priority<br/>then creation time<br/>to EC with most free resources]
+    G -->|No| I[Keep job pending]
     
-    H[Timeout Process<br/>every 5-10s] --> I{Check timeouts}
-    I -->|Past deadline| J[Check DB for result<br/>Reassign job]
-    I -->|Disconnected EC| K[Check DB for result<br/>Reassign with preserved result]
+    J[Timeout Process<br/>every 5-10s] --> K{Check timeouts}
+    K -->|Past deadline| L{Connected ECs<br/>available?}
+    L -->|Yes| M[Check DB for result<br/>Reassign job]
+    L -->|No| N[Keep job pending]
+    K -->|Disconnected EC| O{Connected ECs<br/>available?}
+    O -->|Yes| P[Check DB for result<br/>Reassign with preserved result]
+    O -->|No| Q[Keep job pending]
     
-    L[Rebalancer<br/>every 30-60s] --> M[Check DB for results<br/>Assign pending jobs<br/>to least loaded ECs]
+    R[Rebalancer<br/>every 30-60s] --> S{Connected ECs<br/>available?}
+    S -->|Yes| T[Check DB for results<br/>Assign by priority<br/>to least loaded ECs<br/>Set top priority on reassignments]
+    S -->|No| U[Jobs remain pending]
 ```
 
 ---
@@ -33,37 +41,34 @@ flowchart TD
 
 ### EngineClient (EC)
 
-- `ec_id`: unique identifier for the EC.
-- `last_sync_at`: timestamp of last successful `/engine/sync.json` from this EC.
+- `ec_id`: unique identifier
+- `last_sync_at`: timestamp of last successful sync
+- **Connected**: `now - last_sync_at < 30s` (eligible for assignments)
+- **Disconnected**: `now - last_sync_at >= 30s` (jobs may be reassigned)
 
-**Connected vs disconnected**
+### Job
 
-- **Connected**: `now - last_sync_at < 30s` → eligible for new assignments.
-- **Disconnected**: `now - last_sync_at >= 30s` → not used for new assignments; its jobs may be reassigned.
+- `job_id`: unique identifier
+- `assigned_ec_id` (nullable): current EC assignment
+- `state`: `pending` | `assigned` | `running` | `error` | `finished`
+- `assigned_at`: last assignment timestamp
+- `start_confirm_deadline`: deadline for EC to confirm start (`status: "completed"`)
+- `last_result` (nullable): last result from any EC (preserved on reassignment)
+- `created_at`: creation timestamp
+- `priority`: higher number = higher priority (rebalancer reassignments get top priority)
 
-### Job (server view)
+**Assignment Order**: Priority (descending) → `created_at` (ascending)
 
-- `job_id`: unique job identifier.
-- `assigned_ec_id` (nullable): EC this job is currently assigned/running on.
-- `state` (logical):
-  - `pending` – not yet assigned to any EC.
-  - `assigned` – sent to an EC, awaiting start confirmation.
-  - `running` – EC has confirmed start.
-  - `error` – EC reported `status: "error"` for start.
-  - `finished` – job finished (from business POV).
-- `assigned_at`: when the job was last assigned to an EC.
-- `start_confirm_deadline`: time by which the server expects an EC to send `status: "completed"` (start confirmation) after assignment.
-- `last_result` (nullable): last result received from any EC for this job (stored when EC sends `status: "running"` with result). Used when reassigning to continue calculation.
+**Queue Position**: Count of `pending` jobs with higher priority, or same priority but earlier `created_at` (calculated on-demand)
 
 ---
 
-## Sync Endpoint (Server Perspective)
+## Sync Endpoint
 
-**Endpoint**: `POST /engine/sync.json?engineId={ec_id}`  
-**Headers**: `Authorization: Bearer {auth_token}`
+`POST /engine/sync.json?engineId={ec_id}`  
+Headers: `Authorization: Bearer {auth_token}`
 
-**Request Payload (from EC)**:
-
+**Request** (from EC):
 ```json
 {
   "job_statuses": [
@@ -77,61 +82,48 @@ flowchart TD
 }
 ```
 
+**Response**: List of jobs that should be running on this EC (server determines "new" jobs by checking client's `job_statuses`).
+
 ---
 
 ## Periodic Processes
 
-The server runs two background processes that operate alongside normal request handling.
+### 1. Timeout Reassignment Process (every 5–10s)
 
-### 1. Timeout Reassignment Process
+Handles jobs that failed to start or are on disconnected ECs:
 
-- **Frequency**: frequent (e.g. every 5–10 seconds).
-- **Scope**: only touches jobs that failed to start or are on disconnected ECs.
+- `state = "assigned"` + `now > start_confirm_deadline`: Reassign with top priority (preserve `last_result` if exists)
+- `state = "running"` + disconnected EC: Reassign with top priority (preserve `last_result`)
 
-**Responsibilities**:
+### 2. Rebalancer Process (every 30–60s)
 
-- Find jobs with `state = "assigned"` where `now > start_confirm_deadline`:
-  - Check database for existing `last_result` for this job.
-  - Set job back to `pending` and **reassign immediately** to another connected EC (most free capacity).
-  - If `last_result` exists, include it as \"old\" data when sending to new EC.
-- Find jobs with `state = "running"` where `assigned_ec_id` points to a **disconnected** EC (no sync for ≥ 30s):
-  - Check database for `last_result` for this job.
-  - Mark job as ready for reassignment and include `last_result` as the \"old\" state when sending to the new EC, so calculation can continue from where it left off.
+Optimizes job distribution:
 
-### 2. Rebalancer Process
+- Recompute load for all connected ECs (running job count per EC)
+- Assign `pending` jobs sorted by priority → `created_at` to least loaded ECs (preserve `last_result` if exists)
+- Reassignments get top priority
 
-- **Frequency**: less frequent (e.g. every 30–60 seconds).
-- **Scope**: optimization only; does not handle hard failures.
-
-**Responsibilities**:
-
-- Recompute load for all **connected** ECs (based on number of running jobs per EC from the database).
-- Look at jobs that are `pending` (new or previously failed to start) and assign them to the least loaded ECs.
-- When reassigning jobs (e.g. from overloaded to underloaded ECs), check database for `last_result` and include it as \"old\" data to continue calculation.
-
-Both processes should use **state-based, atomic updates** (e.g. `UPDATE ... WHERE state = 'pending'`) so that they do not conflict with normal job creation or per-request assignment logic.
+Both processes use **atomic state updates** to avoid conflicts with normal request handling. Jobs remain `pending` if no connected ECs available.
 
 ---
 
-## Job Failure Handling Diagram
+## Job Failure Handling
 
 ```mermaid
 sequenceDiagram
     participant Server
     participant EC as EngineClient
 
-    Server->>EC: Job appears in sync response (jobs list)
-    alt Job not received / not started (timeout)
-        EC--xServer: No status 'completed' before deadline
-        Server->>Server: Mark job as pending
-        Server->>Server: Reassign job to another EC
-    else Job received but invalid parameters
-        EC->>Server: job_status(status="error", error_message)
-        Server->>Server: Mark job as failed_to_start
-        Server->>Server: Do not automatically reassign
+    Server->>EC: Job in sync response
+    alt Timeout (not received/started)
+        EC--xServer: No 'completed' before deadline
+        Server->>Server: Reassign with top priority
+    else Invalid parameters
+        EC->>Server: status="error"
+        Server->>Server: Mark as error (no reassign)
     end
 ```
 
-This diagram shows the two distinct failure modes:
-- **Timeout**: no `status: "completed"` before `start_confirm_deadline` → job is treated as not received and is reassigned.
-- **Invalid parameters**: EC returns `status: "error"` → job is marked failed and is not blindly reassigned.
+**Failure modes**:
+- **Timeout**: No `status: "completed"` before deadline → reassigned
+- **Error**: EC reports `status: "error"` → marked failed, not reassigned
